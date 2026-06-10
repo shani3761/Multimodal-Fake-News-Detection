@@ -1,0 +1,124 @@
+# ══════════════════════════════════════════════════════════════════════════
+# FakeShield AI — Production Requirements
+# Multimodal Fake News Detection System · Python 3.10+
+#
+# Install:  pip install -r requirements.txt
+#
+# For GPU (CUDA 11.8):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#
+# For GPU (CUDA 12.1):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# ══════════════════════════════════════════════════════════════════════════
+
+
+# ── Core Python ──────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0            # .env file loading
+pydantic>=2.4.0                 # data validation (FastAPI models)
+pydantic-settings>=2.0.0        # settings management
+
+
+# ── Deep Learning — PyTorch (CPU wheels; replace for GPU — see above) ─────────
+# Install GPU build manually if CUDA is available; these are CPU fallbacks.
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0               # optional but keeps torch consistent
+
+
+# ── NLP / Transformers ────────────────────────────────────────────────────────
+transformers>=4.35.0            # BERT, RoBERTa, DistilBERT pipelines
+tokenizers>=0.15.0              # fast tokenizer backend (used by transformers)
+sentence-transformers>=2.2.2    # sentence embeddings (optional RAG)
+datasets>=2.14.0                # HuggingFace dataset utilities
+huggingface-hub>=0.19.0         # model registry & download
+
+
+# ── Computer Vision ───────────────────────────────────────────────────────────
+Pillow>=10.0.0                  # PIL — image I/O and manipulation
+opencv-python-headless>=4.8.0   # OpenCV without GUI (use headless in containers)
+scikit-image>=0.21.0            # additional image processing utilities
+timm>=0.9.0                     # pretrained vision models (EfficientNet, ViT, etc.)
+
+
+# ── Video Processing ─────────────────────────────────────────────────────────
+moviepy>=1.0.3                  # video read/write + audio extraction
+yt-dlp>=2023.10.0               # download YouTube / Vimeo / direct URLs
+ffmpeg-python>=0.2.0            # Python bindings for ffmpeg subprocess
+
+
+# ── Web Frameworks ────────────────────────────────────────────────────────────
+streamlit>=1.28.0               # Streamlit UI (primary frontend)
+fastapi>=0.104.0                # FastAPI REST server
+uvicorn[standard]>=0.24.0       # ASGI server for FastAPI
+python-multipart>=0.0.6         # multipart/form-data uploads (FastAPI)
+httpx>=0.25.0                   # async HTTP client (FastAPI testing + fetching)
+aiofiles>=23.2.0                # async file I/O for FastAPI
+
+
+# ── Data Science / ML Utils ───────────────────────────────────────────────────
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.11.0                   # signal processing, statistical tests
+scikit-learn>=1.3.0             # metrics, preprocessing, pipelines
+torchmetrics>=1.2.0             # PyTorch metrics (accuracy, F1, AUC)
+joblib>=1.3.0                   # model serialisation and parallel processing
+
+
+# ── Explainability ────────────────────────────────────────────────────────────
+shap>=0.43.0                    # SHAP values for text / tabular models
+lime>=0.2.0.1                   # LIME local explanations
+
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.17.0                  # interactive Plotly charts in Streamlit
+wordcloud>=1.9.0                # word-cloud visualisations (optional)
+kaleido>=0.2.1                  # plotly static image export
+
+
+# ── Database ──────────────────────────────────────────────────────────────────
+SQLAlchemy>=2.0.0               # ORM + core (SQLite default, PostgreSQL optional)
+alembic>=1.12.0                 # database migrations
+aiosqlite>=0.19.0               # async SQLite driver
+
+
+# ── Web Scraping (URL article fetching) ───────────────────────────────────────
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0                     # fast HTML/XML parser for BeautifulSoup
+charset-normalizer>=3.3.0       # encoding detection
+
+
+# ── Report Generation ─────────────────────────────────────────────────────────
+reportlab>=4.0.0                # PDF generation
+WeasyPrint>=60.0                # HTML → PDF (alternative; needs system libs)
+Jinja2>=3.1.0                   # HTML template rendering
+
+
+# ── Logging & Monitoring ─────────────────────────────────────────────────────
+loguru>=0.7.0                   # structured logging with colours
+rich>=13.6.0                    # rich terminal output (tables, progress bars)
+tqdm>=4.66.0                    # progress bars
+
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-magic>=0.4.27            # file type detection by magic bytes
+Pygments>=2.16.0                # syntax highlighting (used in Streamlit)
+click>=8.1.0                    # CLI building (used internally by some libs)
+tenacity>=8.2.3                 # retry logic with exponential back-off
+cachetools>=5.3.0               # TTL / LRU caches
+
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+httpx>=0.25.0                   # also used for FastAPI test client
+
+
+# ── Dev / Lint (optional; comment out in production images) ──────────────────
+# black>=23.9.0
+# ruff>=0.1.0
+# mypy>=1.6.0
+# pre-commit>=3.5.0
