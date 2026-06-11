@@ -1,157 +1,182 @@
+cat > /home/claude/fake_news_detector/main.py << 'ENDOFFILE'
 """
-main.py — FakeShield AI · Streamlit Cloud + CLI Unified Entry Point
-====================================================================
-Works in THREE modes automatically:
+main.py ─ FakeShield AI · Streamlit Cloud & CLI Unified Entry Point
+=====================================================================
+Deploy on share.streamlit.io  →  set "Main file path" to  main.py
+Run locally                   →  streamlit run main.py
+CLI                           →  python main.py --text "..."
+API server                    →  python main.py --web --mode api
 
-  1. Streamlit Cloud / `streamlit run main.py`
-     → Full web UI (detected via Streamlit runtime context)
-
-  2. CLI  →  `python main.py --text "article..." --image photo.jpg`
-     → Command-line analysis, JSON output
-
-  3. Web launcher  →  `python main.py --web [--mode api] [--port N]`
-     → Spawns Streamlit or FastAPI server
-
-The Streamlit-vs-CLI split happens at IMPORT TIME (line ~40) so
-no CLI code ever executes on Streamlit Cloud.
+Architecture
+────────────
+  • ALL project imports live INSIDE functions / @st.cache_resource
+    so a broken optional dependency (reportlab, cv2, torch …) never
+    crashes the whole app at import-time.
+  • __init__.py files are intentionally EMPTY to prevent eager-loading.
+  • Path setup happens on line 1 before anything else.
 """
 
 from __future__ import annotations
-import os
-import sys
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0.  ABSOLUTE FIRST — sys.path + working directory
+#     Must run before ANY other import so every "from x import y" resolves.
+# ══════════════════════════════════════════════════════════════════════════════
+import os, sys
 from pathlib import Path
 
-# ── 1. Fix import paths — MUST be first ─────────────────────────────────────
-ROOT = Path(__file__).parent.resolve()
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+_ROOT = Path(__file__).parent.resolve()
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-# ── 2. Detect Streamlit runtime ──────────────────────────────────────────────
-def _running_in_streamlit() -> bool:
-    """Return True when this file is being executed by the Streamlit runner."""
-    # Primary check: Streamlit sets a script-run context
+# Ensure sub-packages can also find the project root via os.getcwd()
+os.chdir(_ROOT)
+
+# Propagate to child processes (uvicorn, subprocess launchers)
+os.environ["PYTHONPATH"] = (
+    str(_ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1.  Detect Streamlit runtime
+# ══════════════════════════════════════════════════════════════════════════════
+def _in_streamlit() -> bool:
+    """Return True when Streamlit is executing this file."""
+    # Method A: official runtime API (works for both local & Cloud)
     try:
         from streamlit.runtime.scriptrunner import get_script_run_ctx
-        return get_script_run_ctx() is not None
+        if get_script_run_ctx() is not None:
+            return True
     except Exception:
         pass
-    # Fallback: Streamlit Cloud sets this env var
+    # Method B: Streamlit Cloud sets this env variable
     if os.environ.get("STREAMLIT_SERVER_PORT"):
         return True
-    # Fallback 2: check argv for streamlit runner
-    return any("streamlit" in arg for arg in sys.argv[:2])
-
-_IN_STREAMLIT = _running_in_streamlit()
+    # Method C: launched as  streamlit run main.py
+    return len(sys.argv) >= 2 and "streamlit" in sys.argv[0].lower()
 
 
-# ════════════════════════════════════════════════════════════════════════════
-#  MODE A — STREAMLIT WEB UI
-#  Executed when deployed on share.streamlit.io OR `streamlit run main.py`
-# ════════════════════════════════════════════════════════════════════════════
+_STREAMLIT = _in_streamlit()
 
-if _IN_STREAMLIT:
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2A.  STREAMLIT MODE  ─ full web UI
+# ══════════════════════════════════════════════════════════════════════════════
+if _STREAMLIT:
+
     import io
     import warnings
     warnings.filterwarnings("ignore")
 
-    import streamlit as st
-    from PIL import Image
+    import streamlit as st                  # always available on Streamlit Cloud
 
-    # ── Page config — MUST be the very first Streamlit call ─────────────────
+    # ── Page config ── MUST be the VERY FIRST Streamlit call ─────────────────
     st.set_page_config(
-        page_title="FakeShield AI",
-        page_icon="🛡️",
-        layout="wide",
-        initial_sidebar_state="expanded",
+        page_title = "FakeShield AI",
+        page_icon  = "🛡️",
+        layout     = "wide",
+        initial_sidebar_state = "expanded",
     )
 
-    # ── Project imports (all guarded inside this block) ──────────────────────
-    from config import AppConfig
-    from database import AnalysisDatabase
-    from components.ui_components import UIComponents
-    from components.results_display import ResultsDisplay
-    from components.report_generator import ReportGenerator
-    from utils.text_utils import fetch_url_content, is_valid_url, clean_text
-    from utils.score_fusion import ScoreFusion
+    # ── Lazy project imports (inside cached functions = safe) ─────────────────
 
-    AppConfig.ensure_dirs()
+    @st.cache_resource(show_spinner=False)
+    def _cfg():
+        """Load and return AppConfig."""
+        from config import AppConfig          # noqa: PLC0415
+        AppConfig.ensure_dirs()
+        return AppConfig
 
-    # ── Lazy model loaders (cached once per session) ─────────────────────────
-    @st.cache_resource(show_spinner="🧠 Loading BERT text model…")
-    def _text_analyzer():
-        from models.text_model import TextAnalyzer
+    @st.cache_resource(show_spinner=False)
+    def _db():
+        """Return singleton AnalysisDatabase."""
+        from database import AnalysisDatabase  # noqa: PLC0415
+        return AnalysisDatabase()
+
+    @st.cache_resource(show_spinner="🧠  Loading BERT text model…")
+    def _text_model():
+        from models.text_model import TextAnalyzer  # noqa: PLC0415
         a = TextAnalyzer()
         a.load_model()
         return a
 
-    @st.cache_resource(show_spinner="🖼️ Loading image analysis model…")
-    def _image_analyzer():
-        from models.image_model import ImageAnalyzer
+    @st.cache_resource(show_spinner="🖼️  Loading image analysis model…")
+    def _image_model():
+        from models.image_model import ImageAnalyzer  # noqa: PLC0415
         a = ImageAnalyzer()
         a.load_model()
         return a
 
     @st.cache_resource(show_spinner=False)
-    def _video_analyzer():
-        from models.video_model import VideoAnalyzer
+    def _video_model():
+        from models.video_model import VideoAnalyzer  # noqa: PLC0415
         return VideoAnalyzer()
 
     @st.cache_resource(show_spinner=False)
-    def _db():
-        return AnalysisDatabase()
+    def _ui():
+        from components.ui_components import UIComponents  # noqa: PLC0415
+        return UIComponents()
 
-    # ── UI singletons ─────────────────────────────────────────────────────────
-    _ui       = UIComponents()
-    _display  = ResultsDisplay()
-    _reporter = ReportGenerator()
+    @st.cache_resource(show_spinner=False)
+    def _display():
+        from components.results_display import ResultsDisplay  # noqa: PLC0415
+        return ResultsDisplay()
 
-    # ── Session state defaults ────────────────────────────────────────────────
-    _SS_DEFAULTS = {"results": None, "report_html": None,
-                    "report_pdf": None, "_fetched_text": ""}
-    for _k, _v in _SS_DEFAULTS.items():
+    @st.cache_resource(show_spinner=False)
+    def _reporter():
+        from components.report_generator import ReportGenerator  # noqa: PLC0415
+        return ReportGenerator()
+
+    # ── Session-state defaults ────────────────────────────────────────────────
+    _DEFAULTS = {
+        "results":      None,
+        "report_html":  None,
+        "report_pdf":   None,
+        "_fetched":     "",
+    }
+    for _k, _v in _DEFAULTS.items():
         st.session_state.setdefault(_k, _v)
 
-    # ────────────────────────────────────────────────────────────────────────
-    # Helper: run analysis across requested modalities
-    # ────────────────────────────────────────────────────────────────────────
-    def run_analysis(text=None, image=None, video_url=None) -> dict:
+    # ── Helper: run multi-modal analysis ─────────────────────────────────────
+    def _run(text=None, image=None, video_url=None) -> dict:
         results: dict = {}
 
         if text and text.strip():
             with st.spinner("🧠 Analysing text with BERT…"):
                 try:
-                    results["text"] = _text_analyzer().analyze(text.strip())
-                except Exception as exc:
-                    st.warning(f"Text analysis warning: {exc}")
+                    results["text"] = _text_model().analyze(text.strip())
+                except Exception as e:
+                    st.warning(f"Text analysis error: {e}")
 
         if image is not None:
             with st.spinner("🔬 Analysing image (ELA + Grad-CAM)…"):
                 try:
-                    results["image"] = _image_analyzer().analyze(image)
-                except Exception as exc:
-                    st.warning(f"Image analysis warning: {exc}")
+                    results["image"] = _image_model().analyze(image)
+                except Exception as e:
+                    st.warning(f"Image analysis error: {e}")
 
         if video_url and video_url.strip():
             with st.spinner("🎬 Downloading & analysing video frames…"):
                 try:
-                    results["video"] = _video_analyzer().analyze(video_url.strip())
-                except Exception as exc:
-                    st.warning(f"Video analysis warning: {exc}")
+                    results["video"] = _video_model().analyze(video_url.strip())
+                except Exception as e:
+                    st.warning(f"Video analysis error: {e}")
 
         if results:
             try:
+                from utils.score_fusion import ScoreFusion  # noqa: PLC0415
                 results["overall"] = ScoreFusion().fuse(results)
-            except Exception as exc:
-                st.warning(f"Score fusion warning: {exc}")
+            except Exception as e:
+                st.warning(f"Score fusion error: {e}")
 
         return results
 
-    # ────────────────────────────────────────────────────────────────────────
-    # Helper: persist result to SQLite
-    # ────────────────────────────────────────────────────────────────────────
+    # ── Helper: save to SQLite (silent failure — DB must not crash the UI) ───
     def _save(results: dict, atype: str,
               text: str = "", video_url: str = "") -> None:
         try:
+            cfg     = _cfg()
             overall = results.get("overall", {})
             _db().save_analysis({
                 "analysis_type":    atype,
@@ -171,14 +196,11 @@ if _IN_STREAMLIT:
                 },
             })
         except Exception:
-            pass   # DB errors must never crash the UI
+            pass
 
-    # ────────────────────────────────────────────────────────────────────────
-    # Helper: trigger analysis, store in session, rerun
-    # ────────────────────────────────────────────────────────────────────────
-    def _dispatch(text=None, image=None, video_url=None,
-                  atype="text") -> None:
-        r = run_analysis(text=text, image=image, video_url=video_url)
+    # ── Helper: run + persist + rerun ────────────────────────────────────────
+    def _dispatch(text=None, image=None, video_url=None, atype="text") -> None:
+        r = _run(text=text, image=image, video_url=video_url)
         if r:
             _save(r, atype, text or "", video_url or "")
             st.session_state.results    = r
@@ -186,18 +208,40 @@ if _IN_STREAMLIT:
             st.session_state.report_pdf  = None
             st.rerun()
         else:
-            _ui.warning_panel("Analysis returned no results — check your input.")
+            _ui().warning_panel("Analysis returned no results. Check your input.")
 
-    # ════════════════════════════════════════════════════════════════════════
-    #  PAGE LAYOUT
-    # ════════════════════════════════════════════════════════════════════════
+    # ── Fetch text from URL ───────────────────────────────────────────────────
+    def _fetch_url(url: str) -> str:
+        try:
+            from utils.text_utils import fetch_url_content, clean_text  # noqa
+            _, body = fetch_url_content(url)
+            return clean_text(body) if body else ""
+        except Exception:
+            return ""
 
-    _ui.apply_custom_css()
-    _ui.render_header()
-    _ui.render_sidebar(_db())
+    def _valid_url(url: str) -> bool:
+        try:
+            from utils.text_utils import is_valid_url  # noqa
+            return is_valid_url(url)
+        except Exception:
+            return url.startswith("http://") or url.startswith("https://")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PAGE RENDER
+    # ══════════════════════════════════════════════════════════════════════════
+
+    _ui().apply_custom_css()
+    _ui().render_header()
+
+    # ── Sidebar (DB errors must not crash the page) ───────────────────────────
+    try:
+        _ui().render_sidebar(_db())
+    except Exception as _e:
+        with st.sidebar:
+            st.warning(f"Sidebar error: {_e}")
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    t_text, t_img, t_vid, t_comb, t_hist = st.tabs([
+    _t1, _t2, _t3, _t4, _t5 = st.tabs([
         "📝 Text Analysis",
         "🖼️  Image Analysis",
         "🎬 Video Analysis",
@@ -205,406 +249,414 @@ if _IN_STREAMLIT:
         "📊 History",
     ])
 
-    # ── TAB 1: TEXT ──────────────────────────────────────────────────────────
-    with t_text:
+    # ───────────────────────────── TAB 1 · TEXT ──────────────────────────────
+    with _t1:
         st.markdown("### Analyse a news article or text snippet")
-        _ui.info_panel(
-            "Paste article text <b>or</b> a URL — the article will be "
-            "automatically scraped from the page."
+        _ui().info_panel(
+            "Paste article text <b>or</b> a URL — "
+            "the article will be automatically scraped."
         )
-        mode = st.radio(
+
+        _mode = st.radio(
             "Input mode", ["✏️ Paste text", "🔗 Enter URL"],
             horizontal=True, label_visibility="collapsed",
         )
-        text_val = ""
+        _text_val = ""
 
-        if "✏️" in mode:
-            text_val = st.text_area(
-                "Article text", height=220,
+        if "✏️" in _mode:
+            _text_val = st.text_area(
+                "Article text", height=220, label_visibility="collapsed",
                 placeholder="Paste the full article or news excerpt here…",
-                label_visibility="collapsed",
             )
         else:
-            raw_url = st.text_input(
-                "Article URL",
+            _url_in = st.text_input(
+                "Article URL", label_visibility="collapsed",
                 placeholder="https://example.com/article",
-                label_visibility="collapsed",
             )
-            if raw_url:
-                if not is_valid_url(raw_url):
-                    _ui.warning_panel("Please enter a valid HTTP(S) URL.")
+            if _url_in:
+                if not _valid_url(_url_in):
+                    _ui().warning_panel("Please enter a valid HTTP(S) URL.")
                 elif st.button("🌐 Fetch Article", key="fetch_btn"):
                     with st.spinner("Scraping article…"):
-                        _, body = fetch_url_content(raw_url)
-                        st.session_state._fetched_text = clean_text(body) if body else ""
-            if st.session_state._fetched_text:
-                text_val = st.session_state._fetched_text
+                        st.session_state["_fetched"] = _fetch_url(_url_in)
+
+            if st.session_state.get("_fetched"):
+                _text_val = st.session_state["_fetched"]
                 st.text_area(
-                    "Fetched preview", text_val[:500] + "…",
-                    height=120, disabled=True,
+                    "Fetched preview",
+                    _text_val[:500] + ("…" if len(_text_val) > 500 else ""),
+                    height=110, disabled=True,
                 )
 
         if st.button("🔍 Analyze Text", key="btn_text", type="primary"):
-            words = len(text_val.strip().split())
-            if words < AppConfig.MIN_TEXT_WORDS:
-                _ui.warning_panel(
-                    f"Please provide at least {AppConfig.MIN_TEXT_WORDS} words "
-                    f"(you have {words})."
-                )
+            _wc = len(_text_val.strip().split())
+            _min = _cfg().MIN_TEXT_WORDS
+            if _wc < _min:
+                _ui().warning_panel(f"Provide at least {_min} words (you have {_wc}).")
             else:
-                _dispatch(text=text_val, atype="text")
+                _dispatch(text=_text_val, atype="text")
 
-    # ── TAB 2: IMAGE ─────────────────────────────────────────────────────────
-    with t_img:
+    # ───────────────────────────── TAB 2 · IMAGE ─────────────────────────────
+    with _t2:
         st.markdown("### Analyse an image for manipulation or deepfakes")
-        _ui.info_panel(
-            "Supported formats: JPEG, PNG, WebP. "
-            "The system applies Error Level Analysis, noise mapping, and Grad-CAM."
+        _ui().info_panel(
+            "Supported: JPEG, PNG, WebP. "
+            "Applies Error Level Analysis, noise mapping, and Grad-CAM."
         )
-        uploaded = st.file_uploader(
-            "Upload image", type=["jpg","jpeg","png","webp"],
-            label_visibility="collapsed",
-        )
-        if uploaded:
-            pil_img = Image.open(io.BytesIO(uploaded.read())).convert("RGB")
-            c1, c2 = st.columns([1, 2])
-            with c1:
-                st.image(pil_img, caption=uploaded.name, use_column_width=True)
-            with c2:
-                st.markdown(
-                    f"**File:** `{uploaded.name}`  \n"
-                    f"**Dimensions:** {pil_img.width} × {pil_img.height} px  \n"
-                    f"**Mode:** {pil_img.mode}"
-                )
-            if st.button("🔍 Analyze Image", key="btn_img", type="primary"):
-                _dispatch(image=pil_img, atype="image")
 
-    # ── TAB 3: VIDEO ─────────────────────────────────────────────────────────
-    with t_vid:
-        st.markdown("### Analyse video frames for manipulation")
-        _ui.info_panel(
-            f"Supports YouTube, Vimeo, and direct MP4 links. "
-            f"Up to {AppConfig.VIDEO_MAX_FRAMES} frames are extracted and analysed."
-        )
-        vid_url = st.text_input(
-            "Video URL",
-            placeholder="https://www.youtube.com/watch?v=…  or  https://example.com/video.mp4",
+        _uploaded = st.file_uploader(
+            "Upload image", type=["jpg", "jpeg", "png", "webp"],
             label_visibility="collapsed",
+        )
+        if _uploaded:
+            try:
+                from PIL import Image as _PILImage  # noqa
+                _pil = _PILImage.open(io.BytesIO(_uploaded.read())).convert("RGB")
+            except Exception as _e:
+                st.error(f"Could not open image: {_e}")
+                _pil = None
+
+            if _pil:
+                _c1, _c2 = st.columns([1, 2])
+                with _c1:
+                    st.image(_pil, caption=_uploaded.name, use_column_width=True)
+                with _c2:
+                    st.markdown(
+                        f"**File:** `{_uploaded.name}`  \n"
+                        f"**Size:** {_pil.width} × {_pil.height} px  \n"
+                        f"**Mode:** `{_pil.mode}`"
+                    )
+                if st.button("🔍 Analyze Image", key="btn_img", type="primary"):
+                    _dispatch(image=_pil, atype="image")
+
+    # ───────────────────────────── TAB 3 · VIDEO ─────────────────────────────
+    with _t3:
+        st.markdown("### Analyse video frames for manipulation")
+        _max_f = _cfg().VIDEO_MAX_FRAMES
+        _ui().info_panel(
+            f"Supports YouTube, Vimeo, and direct MP4 links. "
+            f"Up to {_max_f} key frames are extracted and analysed independently."
+        )
+
+        _vid_url = st.text_input(
+            "Video URL", label_visibility="collapsed",
+            placeholder="https://www.youtube.com/watch?v=…  or  direct .mp4 link",
         )
         if st.button("🔍 Analyze Video", key="btn_vid", type="primary"):
-            if not vid_url.strip():
-                _ui.warning_panel("Please enter a video URL.")
-            elif not is_valid_url(vid_url.strip()):
-                _ui.warning_panel("Invalid URL — must start with http:// or https://")
+            if not _vid_url.strip():
+                _ui().warning_panel("Please enter a video URL.")
+            elif not _valid_url(_vid_url.strip()):
+                _ui().warning_panel("Invalid URL — must start with http:// or https://")
             else:
-                _dispatch(video_url=vid_url.strip(), atype="video")
+                _dispatch(video_url=_vid_url.strip(), atype="video")
 
-    # ── TAB 4: COMBINED ──────────────────────────────────────────────────────
-    with t_comb:
+    # ───────────────────────────── TAB 4 · COMBINED ──────────────────────────
+    with _t4:
         st.markdown("### Full multimodal analysis — text + image + video")
-        _ui.info_panel(
+        _ui().info_panel(
             "Provide any combination of inputs. "
-            "Scores are fused using weighted averages for maximum accuracy."
+            "All active modalities are fused via weighted averaging."
         )
-        cl, cr = st.columns(2)
-        with cl:
-            comb_text = st.text_area(
+
+        _cl, _cr = st.columns(2)
+        with _cl:
+            _ct = st.text_area(
                 "📝 Article text (optional)", height=150,
-                placeholder="Paste article text…",
+                placeholder="Paste article text here…",
                 label_visibility="collapsed",
             )
-        with cr:
-            comb_img_file = st.file_uploader(
-                "🖼️ Image (optional)", type=["jpg","jpeg","png","webp"],
+        with _cr:
+            _ci_file = st.file_uploader(
+                "🖼️ Image (optional)", type=["jpg", "jpeg", "png", "webp"],
                 key="comb_img", label_visibility="collapsed",
             )
-        comb_vid = st.text_input(
+
+        _cv = st.text_input(
             "🎬 Video URL (optional)",
             placeholder="YouTube or direct MP4 URL (optional)…",
             label_visibility="collapsed",
         )
 
-        has_any = bool(comb_text.strip() or comb_img_file or comb_vid.strip())
+        _has_input = bool(_ct.strip() or _ci_file or _cv.strip())
         if st.button("🔍 Run Multimodal Analysis", key="btn_comb",
-                     type="primary", disabled=not has_any):
-            comb_img = None
-            if comb_img_file:
-                comb_img = Image.open(
-                    io.BytesIO(comb_img_file.read())
-                ).convert("RGB")
+                     type="primary", disabled=not _has_input):
+            _ci_pil = None
+            if _ci_file:
+                try:
+                    from PIL import Image as _PILI  # noqa
+                    _ci_pil = _PILI.open(io.BytesIO(_ci_file.read())).convert("RGB")
+                except Exception:
+                    pass
             _dispatch(
-                text=comb_text.strip() or None,
-                image=comb_img,
-                video_url=comb_vid.strip() or None,
-                atype="combined",
+                text      = _ct.strip() or None,
+                image     = _ci_pil,
+                video_url = _cv.strip() or None,
+                atype     = "combined",
             )
 
-    # ── TAB 5: HISTORY ───────────────────────────────────────────────────────
-    with t_hist:
+    # ───────────────────────────── TAB 5 · HISTORY ───────────────────────────
+    with _t5:
         st.markdown("### 📊 Analysis History")
         try:
-            hist  = _db().get_history(30)
-            stats = _db().get_statistics()
-            hc1, hc2, hc3, hc4 = st.columns(4)
-            hc1.metric("Total Analyses", stats["total"])
-            hc2.metric("🔴 Fake",         stats["fake"])
-            hc3.metric("🟢 Real",         stats["real"])
-            hc4.metric("🟡 Suspicious",   stats["suspicious"])
+            _hist  = _db().get_history(30)
+            _stats = _db().get_statistics()
 
-            if hist:
-                import pandas as pd
-                df = pd.DataFrame(hist)[[
-                    "id","timestamp","analysis_type","overall_label","overall_score"
+            _hc1, _hc2, _hc3, _hc4 = st.columns(4)
+            _hc1.metric("Total",        _stats["total"])
+            _hc2.metric("🔴 Fake",      _stats["fake"])
+            _hc3.metric("🟢 Real",      _stats["real"])
+            _hc4.metric("🟡 Suspicious",_stats["suspicious"])
+
+            if _hist:
+                import pandas as _pd  # noqa
+                _df = _pd.DataFrame(_hist)[[
+                    "id", "timestamp", "analysis_type",
+                    "overall_label", "overall_score"
                 ]]
-                df["overall_score"] = df["overall_score"].apply(
-                    lambda x: f"{x:.1%}" if isinstance(x, float) else "–"
+                _df["overall_score"] = _df["overall_score"].apply(
+                    lambda x: f"{x:.1%}" if isinstance(x, (int, float)) else "–"
                 )
-                df.columns = ["ID","Timestamp","Type","Verdict","Score"]
-                st.dataframe(df, use_container_width=True, hide_index=True)
-                if st.button("🗑️ Clear History"):
+                _df.columns = ["ID", "Timestamp", "Type", "Verdict", "Score"]
+                st.dataframe(_df, use_container_width=True, hide_index=True)
+
+                if st.button("🗑️ Clear All History", key="clr_hist"):
                     _db().clear_all()
+                    st.success("History cleared.")
                     st.rerun()
             else:
-                _ui.info_panel("No analyses yet — run your first analysis above!")
-        except Exception as _hist_err:
-            st.error(f"History error: {_hist_err}")
+                _ui().info_panel("No analyses yet — run your first analysis above!")
 
-    # ── RESULTS PANEL (persists below tabs) ──────────────────────────────────
+        except Exception as _he:
+            st.error(f"History error: {_he}")
+
+    # ── Results panel (persists across tab switches) ──────────────────────────
     if st.session_state.results:
         st.divider()
         st.markdown("## 📊 Analysis Results")
-        _display.render_all(st.session_state.results, _ui)
+
+        try:
+            _display().render_all(st.session_state.results, _ui())
+        except Exception as _re:
+            st.error(f"Results display error: {_re}")
+            st.json({
+                k: v for k, v in st.session_state.results.items()
+                if k not in ("_raw",) and not hasattr(v, "save")
+            })
 
         st.divider()
-        _ui.section_title("📥 Download Report")
-        rc1, rc2, rc3 = st.columns([1, 1, 2])
+        _ui().section_title("📥 Download Report")
+        _rc1, _rc2, _rc3 = st.columns([1, 1, 2])
 
-        with rc1:
-            if st.button("📄 Generate HTML"):
-                st.session_state.report_html = _reporter.generate_html(
-                    st.session_state.results
-                )
+        with _rc1:
+            if st.button("📄 Generate HTML Report", key="gen_html"):
+                try:
+                    st.session_state.report_html = _reporter().generate_html(
+                        st.session_state.results
+                    )
+                except Exception as _e:
+                    st.error(f"HTML report error: {_e}")
+
             if st.session_state.report_html:
-                html_bytes = st.session_state.report_html
-                if isinstance(html_bytes, str):
-                    html_bytes = html_bytes.encode()
+                _html = st.session_state.report_html
                 st.download_button(
                     "⬇️ Download HTML",
-                    data=html_bytes,
-                    file_name="fakeshield_report.html",
-                    mime="text/html",
+                    data   = _html.encode() if isinstance(_html, str) else _html,
+                    file_name = "fakeshield_report.html",
+                    mime   = "text/html",
                 )
 
-        with rc2:
-            if st.button("📑 Generate PDF"):
-                pdf = _reporter.generate_pdf(st.session_state.results)
-                if pdf:
-                    st.session_state.report_pdf = pdf
-                else:
-                    _ui.warning_panel("PDF generation requires reportlab.")
+        with _rc2:
+            if st.button("📑 Generate PDF Report", key="gen_pdf"):
+                try:
+                    _pdf = _reporter().generate_pdf(st.session_state.results)
+                    if _pdf:
+                        st.session_state.report_pdf = _pdf
+                    else:
+                        _ui().warning_panel("PDF needs `reportlab` — pip install reportlab")
+                except Exception as _e:
+                    st.error(f"PDF error: {_e}")
+
             if st.session_state.get("report_pdf"):
                 st.download_button(
                     "⬇️ Download PDF",
-                    data=st.session_state.report_pdf,
-                    file_name="fakeshield_report.pdf",
-                    mime="application/pdf",
+                    data      = st.session_state.report_pdf,
+                    file_name = "fakeshield_report.pdf",
+                    mime      = "application/pdf",
                 )
 
-        with rc3:
-            if st.button("🔄 New Analysis"):
-                for _k in ("results","report_html","report_pdf","_fetched_text"):
-                    st.session_state[_k] = _SS_DEFAULTS.get(_k)
+        with _rc3:
+            if st.button("🔄 Start New Analysis", key="btn_reset"):
+                for _k in ("results", "report_html", "report_pdf", "_fetched"):
+                    st.session_state[_k] = _DEFAULTS.get(_k)
                 st.rerun()
 
 
-# ════════════════════════════════════════════════════════════════════════════
-#  MODE B — CLI / LAUNCHER  (only when NOT in Streamlit)
-# ════════════════════════════════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════════════════════════════════
+# 2B.  CLI / LAUNCHER MODE  ─ only reached when NOT running inside Streamlit
+# ══════════════════════════════════════════════════════════════════════════════
 else:
+
     import argparse
     import json
     import logging
     import subprocess
 
     logging.basicConfig(
-        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-        datefmt="%H:%M:%S",
-        level=logging.INFO,
+        format  = "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+        datefmt = "%H:%M:%S",
+        level   = logging.INFO,
     )
     _log = logging.getLogger("main")
 
     # ── Argument parser ───────────────────────────────────────────────────────
     def _build_parser() -> argparse.ArgumentParser:
         p = argparse.ArgumentParser(
-            prog="main.py",
-            description="🛡️  FakeShield AI — Multimodal Fake News Detection",
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            epilog="""
-Examples
---------
-  # Text only
-  python main.py --text "BREAKING: Shocking revelation exposes deep state!"
-
-  # Text + image
+            prog        = "main.py",
+            description = "🛡️  FakeShield AI — Multimodal Fake News Detection",
+            formatter_class = argparse.RawDescriptionHelpFormatter,
+            epilog = """
+EXAMPLES
+────────
+  python main.py --text "BREAKING: Shocking deep-state revelation!!!"
   python main.py --text "Viral photo proves..." --image evidence.jpg
-
-  # Full multimodal
-  python main.py --text "Breaking news" --image img.jpg --video https://youtu.be/xxx
-
-  # Analyse article from URL (auto-scraped)
-  python main.py --text https://example.com/article
-
-  # Batch mode
+  python main.py --text article.txt --image img.jpg --video https://youtu.be/xxx
+  python main.py --text https://example.com/article         # auto-scraped
   python main.py --batch inputs.json --output results.json
-
-  # Launch Streamlit UI
-  python main.py --web
-
-  # Launch FastAPI server
-  python main.py --web --mode api --port 8000
-
-  # Pre-warm all models
-  python main.py --warmup
+  python main.py --web                                      # Streamlit UI
+  python main.py --web --mode api --port 8000               # FastAPI
+  python main.py --warmup                                   # pre-load models
 """,
         )
-        # Web launcher
-        p.add_argument("--web", action="store_true",
+        p.add_argument("--web",    action="store_true",
                        help="Launch web interface (Streamlit or FastAPI)")
-        p.add_argument("--mode", choices=["streamlit","api"], default="streamlit",
-                       help="Web backend (default: streamlit)")
-        p.add_argument("--host", default="0.0.0.0")
-        p.add_argument("--port", type=int, default=None)
+        p.add_argument("--mode",   choices=["streamlit","api"], default="streamlit")
+        p.add_argument("--host",   default="0.0.0.0")
+        p.add_argument("--port",   type=int, default=None)
         p.add_argument("--reload", action="store_true",
-                       help="Enable hot-reload (FastAPI only)")
-        # CLI inputs
-        g = p.add_argument_group("analysis inputs")
-        g.add_argument("--text",  metavar="TEXT_OR_URL",
-                       help="Article text or URL")
-        g.add_argument("--image", metavar="PATH",
-                       help="Path to image file")
-        g.add_argument("--video", metavar="URL",
-                       help="Video URL")
+                       help="Hot-reload (FastAPI only)")
+
+        g = p.add_argument_group("analysis")
+        g.add_argument("--text",   metavar="TEXT_OR_URL")
+        g.add_argument("--image",  metavar="PATH")
+        g.add_argument("--video",  metavar="URL")
         g.add_argument("--batch",  metavar="JSON",
-                       help="Path to JSON file with list of input dicts")
+                       help="JSON file with list of input dicts")
         g.add_argument("--output", metavar="JSON",
-                       help="Write results to this JSON file (default: stdout)")
-        # Misc
-        p.add_argument("--no-db",   action="store_true",
-                       help="Skip saving result to SQLite")
-        p.add_argument("--warmup",  action="store_true",
-                       help="Pre-load all models and exit")
+                       help="Write JSON results here (default: stdout)")
+
+        p.add_argument("--no-db",   action="store_true")
+        p.add_argument("--warmup",  action="store_true")
         p.add_argument("--verbose", "-v", action="store_true")
         return p
 
-    # ── Web launchers ─────────────────────────────────────────────────────────
+    # ── Launchers ─────────────────────────────────────────────────────────────
     def _launch_streamlit(host: str, port: int) -> None:
         cmd = [
-            sys.executable, "-m", "streamlit", "run",
-            str(ROOT / "main.py"),
-            "--server.address", host,
-            "--server.port", str(port),
+            sys.executable, "-m", "streamlit", "run", str(_ROOT / "main.py"),
+            "--server.address",  host,
+            "--server.port",     str(port),
             "--server.headless", "true",
             "--browser.gatherUsageStats", "false",
         ]
-        _log.info("Starting Streamlit → http://%s:%d", host, port)
+        _log.info("Streamlit → http://%s:%d", host, port)
         try:
             subprocess.run(cmd, check=True)
         except KeyboardInterrupt:
-            _log.info("Stopped.")
+            pass
         except FileNotFoundError:
             _log.error("streamlit not installed — pip install streamlit")
             sys.exit(1)
 
     def _launch_api(host: str, port: int, reload: bool) -> None:
         try:
-            import uvicorn
+            import uvicorn  # noqa
         except ImportError:
             _log.error("uvicorn not installed — pip install uvicorn[standard]")
             sys.exit(1)
-        _log.info("Starting FastAPI → http://%s:%d", host, port)
+        _log.info("FastAPI → http://%s:%d", host, port)
+        import uvicorn  # noqa
         uvicorn.run("api:app", host=host, port=port,
                     reload=reload, log_level="info")
 
     # ── CLI analysis ──────────────────────────────────────────────────────────
     def _run_cli(args: argparse.Namespace) -> None:
-        from inference import FakeNewsInference
-
+        from inference import FakeNewsInference  # noqa: PLC0415
         engine = FakeNewsInference.get_instance()
 
         if args.batch:
             with open(args.batch) as fh:
                 items = json.load(fh)
             if not isinstance(items, list):
-                _log.error("Batch JSON must be a list of dicts")
+                _log.error("Batch JSON must be a list")
                 sys.exit(1)
             results = engine.predict_batch(items, save_to_db=not args.no_db)
-            _write_output([_safe_json(r) for r in results], args.output)
+            _write(_clean(results), args.output)
             return
 
         if not any([args.text, args.image, args.video]):
-            _log.error("No inputs provided — use --text, --image, or --video")
+            _log.error("No inputs — use --text, --image, or --video")
             sys.exit(1)
 
         if args.image and not Path(args.image).is_file():
             _log.error("Image file not found: %s", args.image)
             sys.exit(1)
 
-        _log.info("Running analysis…")
         result = engine.predict(
-            text=args.text,
-            image=args.image,
-            video_url=args.video,
-            save_to_db=not args.no_db,
+            text      = args.text,
+            image     = args.image,
+            video_url = args.video,
+            save_to_db= not args.no_db,
         )
-        _print_summary(result)
-        _write_output(_safe_json(result), args.output)
+        _print_result(result)
+        _write(_clean(result), args.output)
 
-    def _print_summary(r: dict) -> None:
-        v  = r.get("verdict", "?")
+    def _print_result(r: dict) -> None:
+        v  = r.get("verdict",     "?")
         fs = r.get("final_score", 0.5)
-        c  = r.get("confidence", 0.0)
-        em = {"FAKE":"🔴","REAL":"🟢","SUSPICIOUS":"🟡"}.get(v,"⚪")
-        bar = "█" * int(fs * 40) + "░" * (40 - int(fs * 40))
-        print(f"\n{'═'*56}")
-        print(f"  {em}  Verdict:     {v}")
-        print(f"     Fake score:  {fs:.1%}  [{bar}]")
-        print(f"     Confidence:  {c:.1%}")
+        c  = r.get("confidence",  0.0)
+        em = {"FAKE":"🔴","REAL":"🟢","SUSPICIOUS":"🟡"}.get(v, "⚪")
+        bar= "█" * int(fs * 40) + "░" * (40 - int(fs * 40))
+        print(f"\n{'═'*58}")
+        print(f"  {em}  Verdict:    {v}")
+        print(f"     Fake score: {fs:.1%}  [{bar}]")
+        print(f"     Confidence: {c:.1%}")
         for mod, ind in r.get("individual", {}).items():
             s = ind.get("fake_score", 0)
             print(f"     {mod.capitalize():<8}: {s:.1%}  ({ind.get('label','?')})")
         print(f"  ⏱  {r.get('meta',{}).get('elapsed_sec',0):.2f}s")
-        print(f"{'═'*56}\n")
+        print(f"{'═'*58}\n")
 
-    def _safe_json(r: dict) -> dict:
-        return {k: v for k, v in r.items()
-                if k != "_raw" and not hasattr(v, "save")}
+    def _clean(obj):
+        if isinstance(obj, list):
+            return [_clean(x) for x in obj]
+        if isinstance(obj, dict):
+            return {k: _clean(v) for k, v in obj.items()
+                    if k != "_raw" and not hasattr(v, "save")}
+        return obj
 
-    def _write_output(data, path: str | None) -> None:
+    def _write(data, path: str | None) -> None:
         out = json.dumps(data, indent=2, default=str)
         if path:
             Path(path).write_text(out)
-            _log.info("Results written → %s", path)
+            _log.info("Results → %s", path)
         else:
             print(out)
 
     # ── Warm-up ───────────────────────────────────────────────────────────────
     def _warmup() -> None:
-        from inference import FakeNewsInference
-        _log.info("Pre-loading all models…")
+        from inference import FakeNewsInference  # noqa
+        _log.info("Pre-loading models…")
         e = FakeNewsInference.get_instance()
         e.warm_up(("text", "image"))
-        print("\n✅ Models loaded successfully.")
+        print("\n✅ Models loaded.")
         print(f"   Load times: {e._load_times}")
 
-    # ── Main entry point ──────────────────────────────────────────────────────
+    # ── Entry point ───────────────────────────────────────────────────────────
     def main() -> None:
-        from config import AppConfig
+        from config import AppConfig  # noqa
         AppConfig.ensure_dirs()
 
-        parser = _build_parser()
-        args   = parser.parse_args()
-
+        args = _build_parser().parse_args()
         if args.verbose:
             logging.getLogger().setLevel(logging.DEBUG)
 
@@ -624,3 +676,6 @@ Examples
 
     if __name__ == "__main__":
         main()
+ENDOFFILE
+
+echo "✅ main.py written — $(wc -l < main.py) lines"
